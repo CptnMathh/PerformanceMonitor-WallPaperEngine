@@ -1,0 +1,68 @@
+; CpuTempDriver.inf
+; INF file for the StrangeCat CPU Temperature KMDF driver.
+;
+; This driver is a root-enumerated software device (no physical hardware node).
+; Install with:  devcon.exe install CpuTempDriver.inf Root\CpuTempDriver
+; Remove  with:  devcon.exe remove  Root\CpuTempDriver
+;
+; For production deployment, replace the [DefaultInstall] section with a
+; proper [Manufacturer] / [Models] block and submit for WHQL / attestation signing.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider    = %ManufacturerName%
+DriverVer   = 06/14/2026, 1.0.0.0
+CatalogFile = CpuTempDriver.cat
+PnpLockDown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12           ; %windir%\System32\drivers
+
+; ── Manufacturer / Device id ─────────────────────────────────────────────
+[Manufacturer]
+%ManufacturerName% = Standard, NTamd64
+
+[Standard.NTamd64]
+%DeviceDesc% = CpuTempDriver_Install, Root\CpuTempDriver
+
+; ── Install sections ─────────────────────────────────────────────────────
+[CpuTempDriver_Install.NT]
+CopyFiles = CpuTempDriver_CopyFiles
+
+[CpuTempDriver_Install.NT.Services]
+AddService = CpuTempDriver, %SPSVCINST_ASSOCSERVICE%, CpuTempDriver_Service
+
+[CpuTempDriver_CopyFiles]
+CpuTempDriver.sys
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+CpuTempDriver.sys = 1,,
+
+; ── Service definition ───────────────────────────────────────────────────
+[CpuTempDriver_Service]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1                     ; SERVICE_KERNEL_DRIVER
+StartType      = 3                     ; SERVICE_DEMAND_START
+ErrorControl   = 1                     ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\CpuTempDriver.sys
+LoadOrderGroup = Extended Base
+
+; ── WDF section (KMDF runtime – built into Windows 10/11, no coinstaller needed) ─
+[CpuTempDriver_Install.NT.Wdf]
+KmdfService = CpuTempDriver, CpuTempDriver_WdfSection
+
+[CpuTempDriver_WdfSection]
+KmdfLibraryVersion = 1.33
+
+; ── Strings ──────────────────────────────────────────────────────────────
+[Strings]
+ManufacturerName       = "StrangeCat"
+DeviceDesc             = "StrangeCat CPU Temperature Driver"
+ServiceDesc            = "CpuTempDriver"
+DiskName               = "CpuTempDriver Installation Disk"
+SPSVCINST_ASSOCSERVICE = 0x00000002
