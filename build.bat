@@ -37,6 +37,16 @@ xcopy /e /i /y /q "%SRC%base" "%BUILD_DIR%\base" >nul
 xcopy /e /i /y /q "%SRC%ui"   "%BUILD_DIR%\ui"   >nul
 copy /y "%SRC%make_icon_beta.py" "%BUILD_DIR%\make_icon_beta.py" >nul
 
+:: Copy AMD Ryzen Master DLL if available
+set HAS_AMD_DLL=0
+if exist "%SRC%base\AMDRyzenMasterMonitoringDLL.dll" (
+    copy /y "%SRC%base\AMDRyzenMasterMonitoringDLL.dll" "%BUILD_DIR%\base\" >nul
+    echo [INFO] AMD Ryzen Master DLL found and will be included
+    set HAS_AMD_DLL=1
+) else (
+    echo [INFO] AMD Ryzen Master DLL not found - AMD monitoring disabled
+)
+
 :: Generate icon in safe dir
 echo [3/4] Generating icon.ico...
 python "%BUILD_DIR%\make_icon_beta.py"
@@ -49,16 +59,33 @@ if not exist "%BUILD_DIR%\icon.ico" (
 echo [4/4] Building EXE...
 cd /d "%BUILD_DIR%"
 
-pyinstaller --onefile --windowed --name StrangeCatMonitor --icon icon.ico ^
-    --distpath dist --workpath build_tmp --specpath . ^
-    --paths "%BUILD_DIR%" --paths "%BUILD_DIR%\base" ^
-    --hidden-import config --hidden-import collector --hidden-import metrics ^
-    --hidden-import http_server --hidden-import datastore ^
-    --hidden-import ui.app --hidden-import ui.sidebar --hidden-import ui.performance ^
-    --hidden-import ui.settings --hidden-import ui.graphs --hidden-import ui.widgets ^
-    --hidden-import wmi --hidden-import win32com --hidden-import win32com.client ^
-    --hidden-import pystray --hidden-import PIL.Image --hidden-import PIL.ImageDraw ^
-    "%BUILD_DIR%\base\main.py"
+if %HAS_AMD_DLL%==1 (
+    python -m PyInstaller --onefile --windowed --name StrangeCatMonitor --icon icon.ico ^
+        --distpath dist --workpath build_tmp --specpath . ^
+        --paths "%BUILD_DIR%" --paths "%BUILD_DIR%\base" ^
+        --hidden-import config --hidden-import collector --hidden-import metrics ^
+        --hidden-import http_server --hidden-import datastore ^
+        --hidden-import ui.app --hidden-import ui.sidebar --hidden-import ui.performance ^
+        --hidden-import ui.settings --hidden-import ui.graphs --hidden-import ui.widgets ^
+        --hidden-import wmi --hidden-import win32com --hidden-import win32com.client ^
+        --hidden-import pystray --hidden-import PIL.Image --hidden-import PIL.ImageDraw ^
+        --hidden-import ryzen_master ^
+        --add-data "base\ryzen_master.py;base" ^
+        --add-data "base\AMDRyzenMasterMonitoringDLL.dll;base" ^
+        "base\main.py"
+) else (
+    python -m PyInstaller --onefile --windowed --name StrangeCatMonitor --icon icon.ico ^
+        --distpath dist --workpath build_tmp --specpath . ^
+        --paths "%BUILD_DIR%" --paths "%BUILD_DIR%\base" ^
+        --hidden-import config --hidden-import collector --hidden-import metrics ^
+        --hidden-import http_server --hidden-import datastore ^
+        --hidden-import ui.app --hidden-import ui.sidebar --hidden-import ui.performance ^
+        --hidden-import ui.settings --hidden-import ui.graphs --hidden-import ui.widgets ^
+        --hidden-import wmi --hidden-import win32com --hidden-import win32com.client ^
+        --hidden-import pystray --hidden-import PIL.Image --hidden-import PIL.ImageDraw ^
+        --add-data "base\ryzen_master.py;base" ^
+        "base\main.py"
+)
 
 if errorlevel 1 (
     echo.

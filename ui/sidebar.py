@@ -35,10 +35,11 @@ class SidebarItem(tk.Frame):
         )
         self.indicator.pack(side="left", fill="y")
         
-        # Mini graph (hidden for summary/general metric)
+        # Mini graph: static icon for summary metrics
         if metric.get("is_summary"):
+            icon = "⊞" if metric["key"] == "lhm" else "≡"
             self.mini_graph = tk.Label(
-                self, text="≡", font=("Segoe UI", 14),
+                self, text=icon, font=("Segoe UI", 13),
                 bg=bg, fg=metric["color"], width=4
             )
         else:
@@ -185,6 +186,14 @@ class Sidebar(tk.Frame):
         """Update all values."""
         for metric_key, item in self.items.items():
             if metric_key == "general":
+                continue
+            if metric_key == "lhm":
+                lhm = data.get("_lhm", {})
+                item.update_value("● Connecté" if lhm.get("ok") else "○ Inactif")
+                continue
+            if metric_key == "amd":
+                ryzen_ok = data.get("ryzen_ok", False)
+                item.update_value("● Connecté" if ryzen_ok else "○ Inactif")
                 continue
             value = self._extract_value(metric_key, data)
             item.update_value(value)

@@ -9,16 +9,38 @@ def build_metrics(cfg, disk_drives=None):
     lang = cfg.get("language", "fr")
 
     # General summary is always first in the sidebar.
-    metrics = [{
-        "key":        "general",
-        "label":      "GÉNÉRAL",
-        "color":      C["fg_dim"],
-        "unit":       "",
-        "max":        100,
-        "warn":       None,
-        "hot":        None,
-        "is_summary": True,
-    }]
+    metrics = [
+        {
+            "key":        "general",
+            "label":      "GÉNÉRAL",
+            "color":      C["fg_dim"],
+            "unit":       "",
+            "max":        100,
+            "warn":       None,
+            "hot":        None,
+            "is_summary": True,
+        },
+        {
+            "key":        "lhm",
+            "label":      "HW MONITOR",
+            "color":      C["col_fan"],
+            "unit":       "",
+            "max":        100,
+            "warn":       None,
+            "hot":        None,
+            "is_summary": True,
+        },
+        {
+            "key":        "amd",
+            "label":      "AMD RYZEN",
+            "color":      "#ff4500",
+            "unit":       "",
+            "max":        100,
+            "warn":       None,
+            "hot":        None,
+            "is_summary": True,
+        },
+    ]
 
     if cfg.get("show_cpu", True):
         metrics.append({
@@ -135,6 +157,56 @@ def build_metrics(cfg, disk_drives=None):
                 "hot": 90,
             })
     
+    # AMD Ryzen Master metrics (if available)
+    if cfg.get("show_amd_temp", True):
+        u = "°F" if cfg.get("temp_unit") == "F" else "°C"
+        metrics.append({
+            "key": "amd_temp",
+            "label": "AMD CPU TEMP",
+            "color": C["col_temp"],
+            "unit": u,
+            "max": 100,
+            "warn": 80,
+            "hot": 90,
+            "is_temp": True,
+        })
+    
+    if cfg.get("show_amd_ppt", True):
+        metrics.append({
+            "key": "amd_ppt",
+            "label": "AMD PPT (W)",
+            "color": C["col_cpu"],
+            "unit": "W",
+            "max": None,
+            "warn": None,
+            "hot": None,
+            "dynamic": True,
+        })
+    
+    if cfg.get("show_amd_edc", True):
+        metrics.append({
+            "key": "amd_edc",
+            "label": "AMD EDC (A)",
+            "color": C["col_cpu"],
+            "unit": "A",
+            "max": None,
+            "warn": None,
+            "hot": None,
+            "dynamic": True,
+        })
+    
+    if cfg.get("show_amd_tdc", True):
+        metrics.append({
+            "key": "amd_tdc",
+            "label": "AMD TDC (A)",
+            "color": C["col_cpu"],
+            "unit": "A",
+            "max": None,
+            "warn": None,
+            "hot": None,
+            "dynamic": True,
+        })
+    
     return metrics
 
 
@@ -158,6 +230,14 @@ def extract_val(key, data):
         return data.get("cpu_fan")
     elif key == "case_fans":
         return data.get("case_fans")
+    elif key == "amd_temp":
+        return data.get("amd_temp")
+    elif key == "amd_ppt":
+        return data.get("amd_ppt")
+    elif key == "amd_edc":
+        return data.get("amd_edc")
+    elif key == "amd_tdc":
+        return data.get("amd_tdc")
     elif key.startswith("disk_"):
         drive = key.replace("disk_", "")
         disks = data.get("_disks", {})
@@ -175,8 +255,12 @@ def fmt_val(key, val):
         return f"{int(val)} RPM"
     elif key in ("net_dn", "net_up"):
         return f"{val:.2f} MB/s"
-    elif key in ("gpu_temp",):
+    elif key in ("gpu_temp", "amd_temp"):
         return f"{val:.1f}°"
+    elif key in ("amd_ppt",):
+        return f"{val:.1f} W"
+    elif key in ("amd_edc", "amd_tdc"):
+        return f"{val:.1f} A"
     elif isinstance(val, float) and val != int(val):
         return f"{val:.1f}%"
     else:

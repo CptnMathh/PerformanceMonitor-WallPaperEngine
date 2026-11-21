@@ -6,10 +6,19 @@ import time
 import threading
 import collections
 import os
+import json
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 import psutil
 import subprocess
 import ctypes
+
+# ── AMD Ryzen Master SDK ─────────────────────────────────────────────────────
+try:
+    from ryzen_master import init_and_check, get_quick_metrics, get_full_metrics, cleanup
+    _HAS_RYZEN_MASTER = True
+except ImportError:
+    _HAS_RYZEN_MASTER = False
 
 _app_start_time = time.time()
 _net_prev = dict(sent=0, recv=0, t=0.0)
@@ -26,6 +35,19 @@ _disk_drives = []
 _disk_lock = threading.Lock()
 
 _cpu_name_cache = None
+
+# ── AMD Ryzen Master SDK state ───────────────────────────────────────────────
+_ryzen_available = None  # None=untested, True=available, False=not available
+_ryzen_lock = threading.Lock()
+_ryzen_cache = dict(ts=0.0, data={})
+_ryzen_full_cache = dict(ts=0.0, data={})
+
+# ── LibreHardwareMonitor HTTP reader ──────────────────────────────────────────
+LHM_URL         = "http://localhost:8085/data.json"
+_LHM_TIMEOUT    = 1.5
+_LHM_RETRY_FAIL = 60.0
+_lhm_ok         = None   # None=untested  True=ok  False=failed
+_lhm_retry_ts   = 0.0
 
 
 def get_cpu_name():
@@ -80,6 +102,198 @@ def detect_disk_drives():
             return _disk_drives
         except Exception:
             return []
+
+
+# ── LHM helpers ───────────────────────────────────────────────────────────────
+
+# Display order for sensor groups inside each hardware card
+_LHM_GROUP_ORDER = ["load", "temperatures", "fans", "clocks", "voltages", "powers", "data"]
+
+# Friendly labels for each group key (used by LHMView)
+LHM_GROUP_LABELS = {
+    "load":         "Charge",
+    "temperatures": "Températures",
+    "fans":         "Ventilateurs",
+    "clocks":       "Fréquences",
+    "voltages":     "Tensions",
+    "powers":       "Puissance",
+    "data":         "Mémoire",
+}
+
+# Friendly labels for hardware types (used by LHMView)
+LHM_HW_LABELS = {
+    "cpu":  "PROCESSEUR",
+    "gpu":  "CARTE GRAPHIQUE",
+    "ram":  "MÉMOIRE RAM",
+    "mb":   "CARTE MÈRE",
+    "disk": "STOCKAGE",
+}
+
+
+def _lhm_parse_val_unit(raw):
+    """Return (float_value, unit_str) from a LHM sensor string like '45.0 °C'."""
+    parts = str(raw or "").strip().split()
+    if not parts:
+        return None, ""
+    try:
+        val = float(parts[0].replace(",", "."))
+    except ValueError:
+        return None, ""
+    unit = parts[1] if len(parts) > 1 else ""
+    if unit == "GHz":          # normalise to MHz for uniform display
+        val = round(val * 1000, 0)
+        unit = "MHz"
+    return val, unit
+
+
+def _lhm_collect(node, hw_list=None, hw_ctx=None, grp_ctx=None):
+    """Recursively walk the LHM data.json tree.
+
+    Builds a list of hardware dicts, each with:
+      {"name": str, "type": str, "groups": {group_name: [{"name", "val", "unit"}, ...]}}
+    hw_type is detected from ImageURL; group from Text ("Temperatures", "Load", …).
+    Both contexts are sticky across child recursion.
+    """
+    if hw_list is None:
+        hw_list = []
+
+    text = (node.get("Text") or "").strip()
+    img  = (node.get("ImageURL") or "").lower()
+    kids = node.get("Children") or []
+    tl   = text.lower()
+
+    # ── Detect hardware boundary ──────────────────────────────────────────────
+    detected_hw = None
+    if "cpu.png" in img:
+        detected_hw = "cpu"
+    elif "nvidia" in img:
+        detected_hw = "gpu"
+    elif "amd.png" in img:
+        if any(k in tl for k in ("radeon", "rx ", "vega", "navi", "rdna")):
+            detected_hw = "gpu"
+        elif any(k in tl for k in ("ryzen", "athlon", "threadripper", "epyc")):
+            detected_hw = "cpu"
+    elif "ram" in img or tl == "generic memory":
+        detected_hw = "ram"
+    elif any(t in img for t in ("motherboard", "chip.png", "mobo")):
+        detected_hw = "mb"
+    elif any(t in img for t in ("hdd", "ssd")):
+        detected_hw = "disk"
+    # text-based fallback when ImageURL is generic
+    elif hw_ctx is None:
+        if any(k in tl for k in ("geforce", "rtx ", "gtx ", "quadro")):
+            detected_hw = "gpu"
+        elif tl == "generic memory":
+            detected_hw = "ram"
+
+    if detected_hw is not None:
+        hw_ctx = {"name": text, "type": detected_hw, "groups": {}}
+        hw_list.append(hw_ctx)
+        grp_ctx = None
+
+    # ── Detect sensor-group boundary ──────────────────────────────────────────
+    if hw_ctx and tl in ("temperatures", "load", "data", "clocks",
+                         "fans", "powers", "voltages"):
+        grp_ctx = tl
+        hw_ctx["groups"].setdefault(grp_ctx, [])
+
+    # ── Leaf sensor ───────────────────────────────────────────────────────────
+    if not kids:
+        if hw_ctx and grp_ctx:
+            val, unit = _lhm_parse_val_unit(node.get("Value"))
+            if val is not None:
+                hw_ctx["groups"][grp_ctx].append(
+                    {"name": text, "val": val, "unit": unit})
+        return hw_list
+
+    for child in kids:
+        _lhm_collect(child, hw_list, hw_ctx, grp_ctx)
+    return hw_list
+
+
+def _lhm_flat_metrics(hw_list):
+    """Extract key flat metrics from the hardware list to update _data directly."""
+    flat = {}
+    for hw in hw_list:
+        ht     = hw["type"]
+        groups = hw["groups"]
+        if ht == "cpu":
+            for s in groups.get("load", []):
+                if "total" in s["name"].lower():
+                    flat.setdefault("cpu_lhm", s["val"])
+            for s in groups.get("temperatures", []):
+                if "package" in s["name"].lower():
+                    flat["cpu_temp"] = s["val"]
+                elif "cpu_temp" not in flat:
+                    flat["cpu_temp"] = s["val"]
+            # AMD-specific metrics from LHM
+            for s in groups.get("powers", []):
+                n = s["name"].lower()
+                if "package" in n or "ppt" in n:
+                    flat["amd_ppt"] = s["val"]
+                elif "core" in n or "tdc" in n:
+                    flat["amd_tdc"] = s["val"]
+                elif "soc" in n or "edc" in n:
+                    flat["amd_edc"] = s["val"]
+            for s in groups.get("clocks", []):
+                n = s["name"].lower()
+                if "core" in n and ("speed" in n or "clock" in n):
+                    flat["cpu_freq_cur"] = s["val"] / 1000 if s["val"] > 1000 else s["val"]
+        elif ht == "gpu":
+            for s in groups.get("load", []):
+                if s["name"].lower() == "gpu core":
+                    flat["gpu_usage"] = s["val"]      # ← matches Task Manager
+            for s in groups.get("temperatures", []):
+                if "core" in s["name"].lower():
+                    flat.setdefault("gpu_temp", s["val"])
+            for s in groups.get("data", []):
+                n = s["name"].lower()
+                if "used" in n and "memory" in n:
+                    flat["vram_used_gb"] = s["val"]
+                elif "total" in n and "memory" in n:
+                    flat["vram_total_gb"] = s["val"]
+        elif ht in ("mb", "cpu"):   # mobo or CPU sub-chip fans
+            for s in groups.get("fans", []):
+                n = s["name"].lower()
+                if "cpu" in n:
+                    flat.setdefault("cpu_fan", s["val"])
+                else:
+                    flat.setdefault("case_fans", s["val"])
+
+    vt = flat.get("vram_total_gb", 0)
+    vu = flat.get("vram_used_gb")
+    if vt and vu is not None:
+        flat["vram_usage"] = round(vu / vt * 100, 1)
+
+    return flat
+
+
+def collect_from_lhm():
+    """Fetch all hardware sensors from LibreHardwareMonitor's HTTP server.
+
+    Returns a dict with:
+      - Flat keys (gpu_usage, gpu_temp, cpu_temp, …) that override psutil/nvidia-smi
+      - "_lhm_hw": structured hardware list consumed by LHMView
+      - "_lhm_ok": bool indicating successful connection
+    Falls back gracefully (returns {}) when LHM is not running.
+    """
+    global _lhm_ok, _lhm_retry_ts
+    now = time.time()
+    if _lhm_ok is False and now < _lhm_retry_ts:
+        return {"_lhm_ok": False, "_lhm_hw": []}
+    try:
+        with urllib.request.urlopen(LHM_URL, timeout=_LHM_TIMEOUT) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+        hw_list = _lhm_collect(raw)
+        flat    = _lhm_flat_metrics(hw_list)
+        flat["_lhm_ok"] = True
+        flat["_lhm_hw"] = hw_list
+        _lhm_ok = True
+        return flat
+    except Exception:
+        _lhm_ok = False
+        _lhm_retry_ts = now + _LHM_RETRY_FAIL
+        return {"_lhm_ok": False, "_lhm_hw": []}
 
 
 def collect_cpu():
@@ -373,6 +587,101 @@ def collect_fans():
     return dict(cpu_fan=cpu_fan, case_fans=avg_case, case_fans_list=case_fans)
 
 
+# ── AMD Ryzen Master ──────────────────────────────────────────────────────────
+
+def check_ryzen_available():
+    """Check if Ryzen Master SDK is available and initialize it."""
+    global _ryzen_available
+
+    if not _HAS_RYZEN_MASTER:
+        print("[AMD] ryzen_master module not available")
+        _ryzen_available = False
+        return False
+
+    with _ryzen_lock:
+        if _ryzen_available is not None:
+            return _ryzen_available
+
+        try:
+            result = init_and_check()
+            _ryzen_available = result.get("available", False)
+            print(f"[AMD] SDK check result: available={_ryzen_available}, message={result.get('message', 'N/A')}")
+            return _ryzen_available
+        except Exception as e:
+            print(f"[AMD] SDK check failed: {e}")
+            _ryzen_available = False
+            return False
+
+
+def collect_ryzen_quick():
+    """Collect quick AMD Ryzen metrics (lightweight, runs frequently)."""
+    if not _HAS_RYZEN_MASTER:
+        print("[AMD] Module not available")
+        return {}
+
+    with _ryzen_lock:
+        now = time.time()
+        if now - _ryzen_cache["ts"] < 2.0 - 0.1:  # Cache for 2 seconds
+            return dict(_ryzen_cache["data"])
+
+    # Check availability if not done yet
+    if _ryzen_available is None:
+        check_ryzen_available()
+
+    if not _ryzen_available:
+        print("[AMD] SDK not available")
+        return {}
+
+    try:
+        data = get_quick_metrics()
+        if data:
+            data["ryzen_ok"] = True
+            print(f"[AMD] Collected quick metrics: {list(data.keys())}")
+        else:
+            data = {"ryzen_ok": False}
+            print("[AMD] No metrics returned from get_quick_metrics")
+
+        with _ryzen_lock:
+            _ryzen_cache["data"] = data
+            _ryzen_cache["ts"] = now
+        return dict(data)
+    except Exception as e:
+        print(f"[AMD] collect_ryzen_quick failed: {e}")
+        return {"ryzen_ok": False}
+
+
+def collect_ryzen_full():
+    """Collect full AMD Ryzen metrics (comprehensive, runs infrequently)."""
+    if not _HAS_RYZEN_MASTER:
+        return {}
+    
+    with _ryzen_lock:
+        now = time.time()
+        if now - _ryzen_full_cache["ts"] < 10.0 - 0.1:  # Cache for 10 seconds
+            return dict(_ryzen_full_cache["data"])
+    
+    # Check availability if not done yet
+    if _ryzen_available is None:
+        check_ryzen_available()
+    
+    if not _ryzen_available:
+        return {}
+    
+    try:
+        data = get_full_metrics()
+        if data:
+            data["ryzen_ok"] = True
+        else:
+            data = {"ryzen_ok": False}
+        
+        with _ryzen_lock:
+            _ryzen_full_cache["data"] = data
+            _ryzen_full_cache["ts"] = now
+        return dict(data)
+    except Exception:
+        return {"ryzen_ok": False}
+
+
 class DataCollector:
     """Main data collector using ThreadPoolExecutor with optimized rates."""
     
@@ -380,11 +689,12 @@ class DataCollector:
         from config import RATE_CPU, RATE_RAM, RATE_NET, RATE_GPU, RATE_TEMP, RATE_FAN, RATE_DISK, HIST_LEN
         
         self._cfg = cfg
-        self._lock = threading.Lock()
-        self._data = {}
-        self._disks = {}
-        self._hist = {}
-        self._last = {}
+        self._lock    = threading.Lock()
+        self._data    = {}
+        self._disks   = {}
+        self._lhm_data= {"ok": False, "hardware": []}
+        self._hist    = {}
+        self._last    = {}
         self._running = False
         self._pool = ThreadPoolExecutor(
             max_workers=min(os.cpu_count() or 4, 8),
@@ -394,13 +704,13 @@ class DataCollector:
         
         # Initialize histories
         for key in ("cpu", "ram", "gpu", "gpu_temp", "vram", "net_dn", "net_up",
-                    "cpu_temp", "cpu_fan", "case_fans"):
+                    "cpu_temp", "cpu_fan", "case_fans", "amd_temp", "amd_ppt"):
             self._hist[key] = collections.deque([0.0] * HIST_LEN, maxlen=HIST_LEN)
 
         # Running stats for the General section (min / max / sum / count)
         self._stats = {}
         for key in ("cpu", "ram", "gpu", "gpu_temp", "vram", "net_dn", "net_up",
-                    "cpu_temp", "cpu_fan", "case_fans"):
+                    "cpu_temp", "cpu_fan", "case_fans", "amd_temp", "amd_ppt"):
             self._stats[key] = dict(mn=None, mx=None, sm=0.0, cnt=0)
         
         # Initialize network
@@ -409,6 +719,9 @@ class DataCollector:
         
         # Detect disk drives
         detect_disk_drives()
+        
+        # Check AMD Ryzen Master availability at startup
+        check_ryzen_available()
     
     def start(self):
         """Start the collector thread."""
@@ -461,14 +774,19 @@ class DataCollector:
 
         while self._running:
             cfg = self._cfg
-            dispatch("cpu", rate_for("cpu", cfg), collect_cpu)
-            dispatch("ram", rate_for("ram", cfg), collect_ram)
-            dispatch("net", rate_for("net", cfg), lambda: collect_net(cfg))
+            # LHM first: overrides nvidia-smi gpu/temp values when connected
+            dispatch("lhm",  rate_for("lhm",  cfg), collect_from_lhm)
+            dispatch("cpu",  rate_for("cpu",  cfg), collect_cpu)
+            dispatch("ram",  rate_for("ram",  cfg), collect_ram)
+            dispatch("net",  rate_for("net",  cfg), lambda: collect_net(cfg))
             dispatch("proc", rate_for("proc", cfg), collect_procs)
-            dispatch("gpu", rate_for("gpu", cfg), collect_gpu)
+            dispatch("gpu",  rate_for("gpu",  cfg), collect_gpu)
             dispatch("temp", rate_for("temp", cfg), collect_cpu_temp)
             dispatch("fans", rate_for("fans", cfg), collect_fans)
             dispatch("disk", rate_for("disk", cfg), collect_disks)
+            # AMD Ryzen Master (if available)
+            dispatch("ryzen_quick", rate_for("ryzen_quick", cfg), collect_ryzen_quick)
+            dispatch("ryzen_full", rate_for("ryzen_full", cfg), collect_ryzen_full)
             time.sleep(0.1)
 
     def _on_result(self, key, fut, inflight):
@@ -478,6 +796,21 @@ class DataCollector:
             with self._lock:
                 if key == "disk":
                     self._disks = result or {}
+                elif key == "lhm" and isinstance(result, dict):
+                    # Split LHM result: structured data → _lhm_data, flat metrics → _data
+                    self._lhm_data = {
+                        "ok":       bool(result.get("_lhm_ok", False)),
+                        "hardware": result.get("_lhm_hw", []),
+                    }
+                    flat = {k: v for k, v in result.items()
+                            if not k.startswith("_lhm")}
+                    self._data.update(flat)
+                elif key in ("ryzen_quick", "ryzen_full") and isinstance(result, dict):
+                    # Copy AMD metrics and ryzen_ok status
+                    self._data.update(result)
+                    # Ensure ryzen_ok is always set
+                    if "ryzen_ok" in result:
+                        self._data["ryzen_ok"] = result["ryzen_ok"]
                 elif isinstance(result, dict):
                     self._data.update(result)
             self._update_hist(result if key != "disk" else {}, key)
@@ -511,6 +844,15 @@ class DataCollector:
                 ("cpu_fan", data.get("cpu_fan", 0) or 0),
                 ("case_fans", data.get("case_fans", 0) or 0),
             ]
+        elif key == "ryzen_quick":
+            pushes = [
+                ("amd_temp", data.get("amd_temp", 0) or 0),
+                ("amd_ppt", data.get("amd_ppt", 0) or 0),
+                ("amd_edc", data.get("amd_edc", 0) or 0),
+                ("amd_tdc", data.get("amd_tdc", 0) or 0),
+                ("amd_peak_voltage", data.get("amd_peak_voltage", 0) or 0),
+                ("amd_avg_voltage", data.get("amd_avg_voltage", 0) or 0),
+            ]
         
         with self._lock:
             for hkey, hval in pushes:
@@ -534,9 +876,13 @@ class DataCollector:
         """Get current data snapshot."""
         with self._lock:
             d = dict(self._data)
-            d["_disks"] = dict(self._disks)
-            d["_hist"] = {k: list(v) for k, v in self._hist.items()}
-            d["uptime_app"] = time.time() - _app_start_time
+            d["_disks"]    = dict(self._disks)
+            d["_lhm"]      = dict(self._lhm_data)
+            d["_hist"]     = {k: list(v) for k, v in self._hist.items()}
+            d["uptime_app"]= time.time() - _app_start_time
+            # Include ryzen_ok status from cache
+            ryzen_data = _ryzen_cache.get("data", {})
+            d["ryzen_ok"] = ryzen_data.get("ryzen_ok", False)
             # Computed stats: {key: {min, max, avg}}
             stats = {}
             for k, s in self._stats.items():

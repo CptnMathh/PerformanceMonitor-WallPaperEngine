@@ -32,6 +32,8 @@ RATE_GPU = 4.0
 RATE_TEMP = 5.0
 RATE_FAN = 8.0
 RATE_DISK = 10.0
+RATE_RYZEN_QUICK = 2.0
+RATE_RYZEN_FULL = 10.0
 
 
 def rate_for(key, cfg):
@@ -44,7 +46,7 @@ def rate_for(key, cfg):
     cfg = cfg or {}
     mode = cfg.get("refresh_mode", "normal")
     fast = REFRESH_MODES.get(mode, 2.0)
-    if key in ("cpu", "ram", "net", "gpu"):
+    if key in ("cpu", "ram", "net", "gpu", "lhm"):
         return fast
     if key == "proc":
         return max(fast, 3.0)
@@ -54,6 +56,10 @@ def rate_for(key, cfg):
         return 8.0
     if key == "disk":
         return float(cfg.get("disk_interval", 60.0))
+    if key == "ryzen_quick":
+        return 2.0
+    if key == "ryzen_full":
+        return 10.0
     return fast
 
 # Palette Windows 11 Task Manager dark
@@ -127,6 +133,10 @@ DEFAULTS = {
     "show_cpu_fan": True,
     "show_case_fans": True,
     "show_disks": True,
+    "show_amd_temp": True,
+    "show_amd_ppt": True,
+    "show_amd_edc": True,
+    "show_amd_tdc": True,
     "http_enabled": True,
     "http_port": 5100,
     "refresh_mode": "normal",
@@ -168,6 +178,10 @@ TR = {
         "show_cpu_fan": "Afficher CPU FAN",
         "show_case_fans": "Afficher CASE FANS",
         "show_disks": "Afficher Disques",
+        "show_amd_temp": "Afficher AMD CPU TEMP",
+        "show_amd_ppt": "Afficher AMD PPT",
+        "show_amd_edc": "Afficher AMD EDC",
+        "show_amd_tdc": "Afficher AMD TDC",
         "close_lbl": "Action fermeture", "close_reset": "Redemander",
         "temp_src": "Source temp.",
         "minimize": "Minimiser", "quit": "Quitter", "remember": "Se souvenir",
@@ -200,6 +214,10 @@ TR = {
         "show_cpu_fan": "Show CPU FAN",
         "show_case_fans": "Show CASE FANS",
         "show_disks": "Show Disks",
+        "show_amd_temp": "Show AMD CPU TEMP",
+        "show_amd_ppt": "Show AMD PPT",
+        "show_amd_edc": "Show AMD EDC",
+        "show_amd_tdc": "Show AMD TDC",
         "close_lbl": "Close action", "close_reset": "Ask again",
         "temp_src": "Temp source",
         "minimize": "Minimize", "quit": "Quit", "remember": "Remember",

@@ -417,12 +417,378 @@ class GeneralView(tk.Frame):
                 row["avg"].set(f"{s['avg']}{unit}")
 
 
+class LHMView(tk.Frame):
+    """Scrollable view showing all LibreHardwareMonitor sensors grouped by hardware."""
+
+    # Colour accent per hardware type
+    _HW_COLORS = {
+        "cpu":  "#0078d4",
+        "gpu":  "#107c10",
+        "ram":  "#8764b8",
+        "mb":   "#d83b01",
+        "disk": "#ca5010",
+    }
+
+    # Friendly labels imported from collector helpers at runtime to avoid
+    # a circular-import (performance.py → collector.py → config.py)
+    _HW_LABELS   = None
+    _GRP_LABELS  = None
+    _GRP_ORDER   = None
+
+    def __init__(self, parent, metric_meta, **kwargs):
+        super().__init__(parent, bg=C["panel_bg"], **kwargs)
+        self.pack(fill="both", expand=True)
+        self._vars   = {}    # (hw_name, grp, sensor_name) → StringVar
+        self._built  = False # True once the widget tree has been created
+        self._was_ok = None  # last known connection state
+
+        # Lazy-import labels from collector (avoids circular import at module level)
+        if LHMView._HW_LABELS is None:
+            try:
+                import sys, os
+                _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                sys.path.insert(0, os.path.join(_root, "base"))
+                from collector import LHM_GROUP_LABELS, LHM_HW_LABELS, _LHM_GROUP_ORDER
+                LHMView._HW_LABELS  = LHM_HW_LABELS
+                LHMView._GRP_LABELS = LHM_GROUP_LABELS
+                LHMView._GRP_ORDER  = _LHM_GROUP_ORDER
+            except Exception:
+                LHMView._HW_LABELS  = {}
+                LHMView._GRP_LABELS = {}
+                LHMView._GRP_ORDER  = []
+
+        self._build_shell()
+
+    # ── shell (header + scrollable canvas) ───────────────────────────────────
+
+    def _build_shell(self):
+        # Header row
+        hdr = tk.Frame(self, bg=C["panel_bg"])
+        hdr.pack(fill="x", padx=20, pady=(16, 4))
+        tk.Label(hdr, text="HW MONITOR", font=("Segoe UI", 18, "bold"),
+                 bg=C["panel_bg"], fg=C["fg_hi"]).pack(side="left")
+        self._status_lbl = tk.Label(hdr, text="", font=("Segoe UI", 9),
+                                    bg=C["panel_bg"], fg=C["fg_dark"])
+        self._status_lbl.pack(side="left", padx=(14, 0), pady=(8, 0))
+        tk.Frame(self, bg=C["border"], height=1).pack(fill="x", padx=20, pady=(0, 6))
+
+        # Scrollable canvas
+        self._canvas = tk.Canvas(self, bg=C["panel_bg"],
+                                 highlightthickness=0, bd=0)
+        self._sb = tk.Scrollbar(self, orient="vertical",
+                                command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._sb.set)
+        self._sb.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+
+        self._inner = tk.Frame(self._canvas, bg=C["panel_bg"])
+        self._win   = self._canvas.create_window(
+            (0, 0), window=self._inner, anchor="nw")
+
+        self._inner.bind("<Configure>",
+                         lambda e: self._canvas.configure(
+                             scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>",
+                          lambda e: self._canvas.itemconfig(
+                              self._win, width=e.width))
+        self._canvas.bind("<MouseWheel>",
+                          lambda e: self._canvas.yview_scroll(
+                              -1 * (e.delta // 120), "units"))
+
+        # "not connected" placeholder
+        self._placeholder = tk.Frame(self._inner, bg=C["panel_bg"])
+        self._placeholder.pack(fill="x", padx=20, pady=40)
+        tk.Label(self._placeholder, text="LibreHardwareMonitor non connecté",
+                 font=("Segoe UI", 12, "bold"),
+                 bg=C["panel_bg"], fg=C["fg_dark"]).pack()
+        tk.Label(self._placeholder,
+                 text=("Lancez LHM → Options → Remote Web Server\n"
+                       "Activez 'Run' sur le port 8085, puis relancez."),
+                 font=("Segoe UI", 9),
+                 bg=C["panel_bg"], fg=C["fg_dark"],
+                 justify="center").pack(pady=(8, 0))
+
+    # ── build sensor widgets once LHM connects ────────────────────────────────
+
+    def _build_sensors(self, hardware):
+        """Create the full sensor widget tree from the hardware list."""
+        self._placeholder.pack_forget()
+        self._vars.clear()
+
+        for widget in list(self._inner.children.values()):
+            if widget is not self._placeholder:
+                widget.destroy()
+
+        hw_labels  = self._HW_LABELS  or {}
+        grp_labels = self._GRP_LABELS or {}
+        grp_order  = self._GRP_ORDER  or []
+
+        for hw in hardware:
+            hw_type  = hw.get("type", "")
+            hw_name  = hw.get("name", "?")
+            groups   = hw.get("groups", {})
+            color    = self._HW_COLORS.get(hw_type, C["fg_dim"])
+            hw_lbl   = hw_labels.get(hw_type, hw_type.upper())
+
+            # Hardware card
+            card = tk.Frame(self._inner, bg=C["surface"],
+                            highlightbackground=color,
+                            highlightthickness=1)
+            card.pack(fill="x", padx=16, pady=(8, 2))
+
+            # Card header
+            card_hdr = tk.Frame(card, bg=color)
+            card_hdr.pack(fill="x")
+            tk.Label(card_hdr,
+                     text=f"  {hw_lbl}  —  {hw_name}",
+                     font=("Segoe UI", 8, "bold"),
+                     bg=color, fg="#ffffff",
+                     anchor="w", pady=4).pack(fill="x")
+
+            body = tk.Frame(card, bg=C["surface"])
+            body.pack(fill="x", padx=8, pady=6)
+
+            # Sensor groups in defined order
+            ordered_grps = [g for g in grp_order if g in groups]
+            ordered_grps += [g for g in groups if g not in grp_order]
+
+            for grp in ordered_grps:
+                sensors = groups[grp]
+                if not sensors:
+                    continue
+                glbl = grp_labels.get(grp, grp.capitalize())
+                tk.Label(body, text=glbl,
+                         font=("Segoe UI", 7, "bold"),
+                         bg=C["surface"], fg=color,
+                         anchor="w").pack(fill="x", padx=4, pady=(6, 2))
+
+                for s in sensors:
+                    row = tk.Frame(body, bg=C["surface"])
+                    row.pack(fill="x", padx=4, pady=1)
+                    tk.Label(row, text=s["name"],
+                             font=("Segoe UI", 8),
+                             bg=C["surface"], fg=C["fg"],
+                             anchor="w", width=26).pack(side="left")
+                    var = tk.StringVar(
+                        value=f"{s['val']:.1f} {s['unit']}")
+                    tk.Label(row, textvariable=var,
+                             font=("Consolas", 9),
+                             bg=C["surface2"], fg=C["fg_hi"],
+                             anchor="e", width=14,
+                             relief="flat", padx=6, pady=2
+                             ).pack(side="right")
+                    self._vars[(hw_name, grp, s["name"])] = var
+
+        self._built = True
+
+    # ── update (called every poll tick) ──────────────────────────────────────
+
+    def update(self, data, history):
+        lhm      = data.get("_lhm", {})
+        is_ok    = bool(lhm.get("ok", False))
+        hardware = lhm.get("hardware", [])
+
+        # Update status badge
+        if is_ok:
+            self._status_lbl.configure(
+                text="● Connecté via LHM", fg=C.get("ok", "#16c60c"))
+        else:
+            self._status_lbl.configure(
+                text="○ En attente…", fg=C["fg_dark"])
+
+        # If connection state changed, rebuild widget tree
+        if is_ok != self._was_ok:
+            self._was_ok = is_ok
+            if is_ok:
+                self._placeholder.pack_forget()
+                self._build_sensors(hardware)
+            else:
+                self._built = False
+                self._placeholder.pack(fill="x", padx=20, pady=40)
+            return
+
+        if not is_ok or not self._built:
+            return
+
+        # Efficient value-only updates via StringVars
+        for hw in hardware:
+            hw_name = hw.get("name", "")
+            for grp, sensors in hw.get("groups", {}).items():
+                for s in sensors:
+                    key = (hw_name, grp, s["name"])
+                    var = self._vars.get(key)
+                    if var:
+                        var.set(f"{s['val']:.1f} {s['unit']}")
+
+
+class AMDView(tk.Frame):
+    """View showing AMD Ryzen Master metrics."""
+
+    def __init__(self, parent, metric_meta, **kwargs):
+        super().__init__(parent, bg=C["panel_bg"], **kwargs)
+        self.pack(fill="both", expand=True)
+        self._vars = {}
+        self._built = False
+        self._was_ok = None
+        self._build_shell()
+
+    def _build_shell(self):
+        # Header row
+        hdr = tk.Frame(self, bg=C["panel_bg"])
+        hdr.pack(fill="x", padx=20, pady=(16, 4))
+        tk.Label(hdr, text="AMD RYZEN MASTER", font=("Segoe UI", 18, "bold"),
+                 bg=C["panel_bg"], fg="#ff4500").pack(side="left")
+        self._status_lbl = tk.Label(hdr, text="", font=("Segoe UI", 9),
+                                    bg=C["panel_bg"], fg=C["fg_dark"])
+        self._status_lbl.pack(side="left", padx=(14, 0), pady=(8, 0))
+        tk.Frame(self, bg=C["border"], height=1).pack(fill="x", padx=20, pady=(0, 6))
+
+        # Scrollable canvas
+        self._canvas = tk.Canvas(self, bg=C["panel_bg"],
+                                 highlightthickness=0, bd=0)
+        self._sb = tk.Scrollbar(self, orient="vertical",
+                                command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._sb.set)
+        self._sb.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+
+        self._inner = tk.Frame(self._canvas, bg=C["panel_bg"])
+        self._win = self._canvas.create_window(
+            (0, 0), window=self._inner, anchor="nw")
+
+        self._inner.bind("<Configure>",
+                         lambda e: self._canvas.configure(
+                             scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>",
+                          lambda e: self._canvas.itemconfig(
+                              self._win, width=e.width))
+        self._canvas.bind("<MouseWheel>",
+                          lambda e: self._canvas.yview_scroll(
+                              -1 * (e.delta // 120), "units"))
+
+        # "not connected" placeholder
+        self._placeholder = tk.Frame(self._inner, bg=C["panel_bg"])
+        self._placeholder.pack(fill="x", padx=20, pady=40)
+        tk.Label(self._placeholder, text="AMD Ryzen Master SDK non connecté",
+                 font=("Segoe UI", 12, "bold"),
+                 bg=C["panel_bg"], fg=C["fg_dark"]).pack()
+        tk.Label(self._placeholder,
+                 text=("Le DLL AMDRyzenMasterMonitoringDLL.dll est présent\n"
+                       "mais le SDK n'a pas pu être initialisé.\n"
+                       "Vérifiez que vous avez les droits administrateur\n"
+                       "et que le driver Ryzen Master est installé."),
+                 font=("Segoe UI", 9),
+                 bg=C["panel_bg"], fg=C["fg_dark"],
+                 justify="center").pack(pady=(8, 0))
+
+    def _build_metrics(self):
+        """Build AMD metrics display."""
+        self._placeholder.pack_forget()
+        self._vars.clear()
+
+        for widget in list(self._inner.children.values()):
+            if widget is not self._placeholder:
+                widget.destroy()
+
+        # Group 1: Temperature & Power
+        grp1 = tk.Frame(self._inner, bg=C["panel_bg"])
+        grp1.pack(fill="x", padx=20, pady=(12, 8))
+        tk.Label(grp1, text="TEMPÉRATURE & PUISSANCE", font=("Segoe UI", 10, "bold"),
+                 bg=C["panel_bg"], fg=C["fg_hi"]).pack(anchor="w", pady=(0, 8))
+
+        grid1 = tk.Frame(grp1, bg=C["panel_bg"])
+        grid1.pack(fill="x")
+        for c in range(2):
+            grid1.columnconfigure(c, weight=1, uniform="amd")
+
+        self._add_metric_card(grid1, "amd_temp", "Température CPU", "°C", 0, 0)
+        self._add_metric_card(grid1, "amd_ppt", "PPT (Package Power)", "W", 0, 1)
+
+        # Group 2: Current Limits
+        grp2 = tk.Frame(self._inner, bg=C["panel_bg"])
+        grp2.pack(fill="x", padx=20, pady=(8, 8))
+        tk.Label(grp2, text="LIMITES DE COURANT", font=("Segoe UI", 10, "bold"),
+                 bg=C["panel_bg"], fg=C["fg_hi"]).pack(anchor="w", pady=(0, 8))
+
+        grid2 = tk.Frame(grp2, bg=C["panel_bg"])
+        grid2.pack(fill="x")
+        for c in range(2):
+            grid2.columnconfigure(c, weight=1, uniform="amd")
+
+        self._add_metric_card(grid2, "amd_edc", "EDC (Electrical Design Current)", "A", 0, 0)
+        self._add_metric_card(grid2, "amd_tdc", "TDC (Thermal Design Current)", "A", 0, 1)
+
+        # Group 3: Voltages
+        grp3 = tk.Frame(self._inner, bg=C["panel_bg"])
+        grp3.pack(fill="x", padx=20, pady=(8, 8))
+        tk.Label(grp3, text="TENSIONS", font=("Segoe UI", 10, "bold"),
+                 bg=C["panel_bg"], fg=C["fg_hi"]).pack(anchor="w", pady=(0, 8))
+
+        grid3 = tk.Frame(grp3, bg=C["panel_bg"])
+        grid3.pack(fill="x")
+        for c in range(2):
+            grid3.columnconfigure(c, weight=1, uniform="amd")
+
+        self._add_metric_card(grid3, "amd_peak_voltage", "Tension de crête", "V", 0, 0)
+        self._add_metric_card(grid3, "amd_avg_voltage", "Tension moyenne", "V", 0, 1)
+
+        self._built = True
+
+    def _add_metric_card(self, parent, key, label, unit, row, col):
+        """Add a metric card to the grid."""
+        card = tk.Frame(parent, bg=C["surface2"], relief="flat", bd=0)
+        card.grid(row=row, column=col, padx=(0 if col == 0 else 6, 0), pady=3, sticky="ew")
+
+        tk.Label(card, text=label, font=("Segoe UI", 8),
+                 bg=C["surface2"], fg=C["fg_dim"]).pack(anchor="w", padx=8, pady=(6, 2))
+
+        var = tk.StringVar(value="—")
+        tk.Label(card, textvariable=var, font=("Consolas", 12, "bold"),
+                 bg=C["surface2"], fg=C["fg_hi"]).pack(anchor="w", padx=8, pady=(0, 6))
+
+        self._vars[key] = (var, unit)
+
+    def update(self, data, history):
+        """Update AMD metrics."""
+        ryzen_ok = data.get("ryzen_ok", False)
+
+        if ryzen_ok != self._was_ok:
+            self._was_ok = ryzen_ok
+            if ryzen_ok:
+                self._status_lbl.configure(text="● Connecté", fg=C["ok"])
+                if not self._built:
+                    self._build_metrics()
+            else:
+                self._status_lbl.configure(text="○ Inactif", fg=C["fg_dark"])
+                if self._built:
+                    self._placeholder.pack(fill="x", padx=20, pady=40)
+                    for widget in list(self._inner.children.values()):
+                        if widget is not self._placeholder:
+                            widget.destroy()
+                    self._built = False
+
+        if not ryzen_ok or not self._built:
+            return
+
+        # Update metric values
+        for key, (var, unit) in self._vars.items():
+            val = data.get(key)
+            if val is not None:
+                var.set(f"{val:.1f} {unit}")
+            else:
+                var.set("—")
+
+
 def create_performance_view(parent, metric_meta):
     """Factory function to create appropriate performance view."""
     key = metric_meta["key"]
 
     if key == "general":
         return GeneralView(parent, metric_meta)
+    elif key == "lhm":
+        return LHMView(parent, metric_meta)
+    elif key == "amd":
+        return AMDView(parent, metric_meta)
     elif key == "cpu":
         return CPUView(parent, metric_meta)
     elif key == "ram":
