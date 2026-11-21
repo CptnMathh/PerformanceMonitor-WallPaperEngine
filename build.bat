@@ -35,16 +35,6 @@ xcopy /e /i /y /q "%HERE%base" "%BUILD_DIR%\base" >nul
 copy /y "%HERE%main.py"      "%BUILD_DIR%\main.py"      >nul
 copy /y "%HERE%\make_icon_minimal.py" "%BUILD_DIR%\make_icon_minimal.py" >nul
 
-:: Copy AMD Ryzen Master DLL if available
-set HAS_AMD_DLL=0
-if exist "%HERE%base\AMDRyzenMasterMonitoringDLL.dll" (
-    copy /y "%HERE%base\AMDRyzenMasterMonitoringDLL.dll" "%BUILD_DIR%\base\" >nul
-    echo [INFO] AMD Ryzen Master DLL found and will be included
-    set HAS_AMD_DLL=1
-) else (
-    echo [INFO] AMD Ryzen Master DLL not found - AMD monitoring disabled
-)
-
 echo [3/4] Generating icon.ico...
 python "%BUILD_DIR%\make_icon_minimal.py"
 if not exist "%BUILD_DIR%\icon.ico" (
@@ -55,30 +45,14 @@ if not exist "%BUILD_DIR%\icon.ico" (
 echo [4/4] Building EXE...
 cd /d "%BUILD_DIR%"
 
-if %HAS_AMD_DLL%==1 (
-    python -m PyInstaller --onefile --windowed --name StrangeCatMinimal --icon icon.ico ^
-        --distpath dist --workpath build_tmp --specpath . ^
-        --paths "%BUILD_DIR%" --paths "%BUILD_DIR%\base" ^
-        --hidden-import config --hidden-import collector --hidden-import metrics ^
-        --hidden-import http_server --hidden-import datastore ^
-        --hidden-import wmi --hidden-import win32com --hidden-import win32com.client ^
-        --hidden-import pystray --hidden-import PIL.Image --hidden-import PIL.ImageDraw ^
-        --hidden-import ryzen_master ^
-        --add-data "base\ryzen_master.py;base" ^
-        --add-data "base\AMDRyzenMasterMonitoringDLL.dll;base" ^
-        "%BUILD_DIR%\main.py"
-) else (
-    python -m PyInstaller --onefile --windowed --name StrangeCatMinimal --icon icon.ico ^
-        --distpath dist --workpath build_tmp --specpath . ^
-        --paths "%BUILD_DIR%" --paths "%BUILD_DIR%\base" ^
-        --hidden-import config --hidden-import collector --hidden-import metrics ^
-        --hidden-import http_server --hidden-import datastore ^
-        --hidden-import wmi --hidden-import win32com --hidden-import win32com.client ^
-        --hidden-import pystray --hidden-import PIL.Image --hidden-import PIL.ImageDraw ^
-        --hidden-import ryzen_master ^
-        --add-data "base\ryzen_master.py;base" ^
-        "%BUILD_DIR%\main.py"
-)
+pyinstaller --onefile --windowed --name StrangeCatMinimal --icon icon.ico ^
+    --distpath dist --workpath build_tmp --specpath . ^
+    --paths "%BUILD_DIR%" --paths "%BUILD_DIR%\base" ^
+    --hidden-import config --hidden-import collector --hidden-import metrics ^
+    --hidden-import http_server --hidden-import datastore ^
+    --hidden-import wmi --hidden-import win32com --hidden-import win32com.client ^
+    --hidden-import pystray --hidden-import PIL.Image --hidden-import PIL.ImageDraw ^
+    "%BUILD_DIR%\main.py"
 
 if errorlevel 1 (
     echo.
