@@ -35,6 +35,17 @@ if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
 mkdir "%BUILD_DIR%"
 copy /y "%SRC%strangecat_monitor.py" "%BUILD_DIR%\strangecat_monitor.py" >nul
 copy /y "%SRC%make_icon_stable.py"          "%BUILD_DIR%\make_icon_stable.py"          >nul
+copy /y "%SRC%ryzen_master.py"              "%BUILD_DIR%\ryzen_master.py"              >nul
+
+:: Copy AMD Ryzen Master DLL if available
+if exist "%SRC%AMDRyzenMasterMonitoringDLL.dll" (
+    copy /y "%SRC%AMDRyzenMasterMonitoringDLL.dll" "%BUILD_DIR%\" >nul
+    echo [INFO] AMD Ryzen Master DLL found and will be included
+    set HAS_AMD_DLL=1
+) else (
+    echo [INFO] AMD Ryzen Master DLL not found - AMD monitoring disabled
+    set HAS_AMD_DLL=0
+)
 
 :: Generate icon in safe dir
 echo [3/4] Generating icon.ico...
@@ -48,7 +59,11 @@ if not exist "%BUILD_DIR%\icon.ico" (
 echo [4/4] Building EXE...
 cd /d "%BUILD_DIR%"
 
-pyinstaller --onefile --windowed --name StrangeCatMonitor --icon icon.ico --distpath dist --workpath build_tmp --specpath . strangecat_monitor.py
+if %HAS_AMD_DLL%==1 (
+    python -m PyInstaller --onefile --windowed --name StrangeCatMonitor --icon icon.ico --distpath dist --workpath build_tmp --specpath . --hidden-import ryzen_master --add-data "ryzen_master.py;." --add-data "AMDRyzenMasterMonitoringDLL.dll;." strangecat_monitor.py
+) else (
+    python -m PyInstaller --onefile --windowed --name StrangeCatMonitor --icon icon.ico --distpath dist --workpath build_tmp --specpath . --hidden-import ryzen_master --add-data "ryzen_master.py;." strangecat_monitor.py
+)
 
 if errorlevel 1 (
     echo.

@@ -13,6 +13,13 @@ import psutil, subprocess, threading, time, sys, os, json, socket
 import winreg, ctypes, collections
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# ── AMD Ryzen Master SDK ─────────────────────────────────────────────────────
+try:
+    from ryzen_master import init_and_check, get_quick_metrics, get_full_metrics, cleanup
+    _HAS_RYZEN_MASTER = True
+except ImportError:
+    _HAS_RYZEN_MASTER = False
+
 try:
     ctypes.windll.kernel32.FreeConsole()
 except Exception:
@@ -53,6 +60,7 @@ DEFAULTS = {
     "show_cpu": True, "show_cpu_temp": True, "show_ram": True,
     "show_gpu": True, "show_gpu_temp": True, "show_vram": True,
     "show_net": True,
+    "show_amd_temp": True, "show_amd_ppt": True, "show_amd_edc": True, "show_amd_tdc": True,
     "http_enabled": True, "http_port": 5100,
     "pos_x": 120, "pos_y": 120,
     "window_width": 380,
@@ -376,15 +384,62 @@ _perf_data = {}
 
 # Performance mode refresh rates (in seconds)
 PERF_MODE_RATES = {
-    "realtimes": {"disk": 10, "ram": 1, "cpu": 1, "gpu": 1, "vram": 1, "net": 1},
-    "normal": {"disk": 30, "ram": 2, "cpu": 2, "gpu": 2, "vram": 2, "net": 2},
-    "optimized": {"disk": 60, "ram": 4, "cpu": 4, "gpu": 4, "vram": 4, "net": 4},
-    "low": {"disk": 300, "ram": 10, "cpu": 10, "gpu": 10, "vram": 10, "net": 10},
+    "realtimes": {"disk": 10, "ram": 1, "cpu": 1, "gpu": 1, "vram": 1, "net": 1, "amd": 2},
+    "normal": {"disk": 30, "ram": 2, "cpu": 2, "gpu": 2, "vram": 2, "net": 2, "amd": 2},
+    "optimized": {"disk": 60, "ram": 4, "cpu": 4, "gpu": 4, "vram": 4, "net": 4, "amd": 10},
+    "low": {"disk": 300, "ram": 10, "cpu": 10, "gpu": 10, "vram": 10, "net": 10, "amd": 10},
 }
+
+# ── AMD Ryzen Master State ───────────────────────────────────────────────────
+_ryzen_available = None
+_ryzen_lock = threading.Lock()
+_ryzen_cache = dict(ts=0.0, data={})
+
+def check_ryzen_available():
+    """Check if Ryzen Master SDK is available."""
+    global _ryzen_available
+    if not _HAS_RYZEN_MASTER:
+        _ryzen_available = False
+        return False
+    with _ryzen_lock:
+        if _ryzen_available is not None:
+            return _ryzen_available
+        try:
+            result = init_and_check()
+            _ryzen_available = result.get("available", False)
+            return _ryzen_available
+        except Exception:
+            _ryzen_available = False
+            return False
+
+def collect_ryzen():
+    """Collect AMD Ryzen metrics."""
+    if not _HAS_RYZEN_MASTER:
+        return {}
+    with _ryzen_lock:
+        now = time.time()
+        if now - _ryzen_cache["ts"] < 2.0:
+            return dict(_ryzen_cache["data"])
+    if _ryzen_available is None:
+        check_ryzen_available()
+    if not _ryzen_available:
+        return {}
+    try:
+        data = get_quick_metrics()
+        if data:
+            data["ryzen_ok"] = True
+        else:
+            data = {"ryzen_ok": False}
+        with _ryzen_lock:
+            _ryzen_cache["data"] = data
+            _ryzen_cache["ts"] = now
+        return dict(data)
+    except Exception:
+        return {"ryzen_ok": False}
 
 def collect_perf(metrics_to_collect=None):
     """Collect performance metrics. If metrics_to_collect is provided, only collect those metrics."""
-    metrics_to_collect = metrics_to_collect or ["cpu", "ram", "gpu", "vram", "disk", "net", "cpu_temp"]
+    metrics_to_collect = metrics_to_collect or ["cpu", "ram", "gpu", "vram", "disk", "net", "cpu_temp", "amd"]
     
     # Start with existing data to preserve values for metrics not being collected
     with _perf_lock:
@@ -425,6 +480,14 @@ def collect_perf(metrics_to_collect=None):
             drive_lower = drive.lower().replace(":", "")
             key = f"{drive_lower}_disk"
             block[key] = f"{data['used_gb']} GB/{data['total_gb']} GB"
+    
+    if "amd" in metrics_to_collect:
+        amd = collect_ryzen()
+        if amd.get("ryzen_ok"):
+            block["amd_temp"] = amd.get("amd_temp")
+            block["amd_ppt"] = amd.get("amd_ppt")
+            block["amd_edc"] = amd.get("amd_edc")
+            block["amd_tdc"] = amd.get("amd_tdc")
     
     block["timestamp"] = time.time()
     payload = {"timestamp": time.time(), "psutil": block}
